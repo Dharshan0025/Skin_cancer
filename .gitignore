@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+.env/
+.venv/
+ENV/
+
+# Large ML model files (too large for GitHub)
+*.h5
+*.hdf5
+*.pkl
+*.pt
+*.pth
+*.onnx
+*.pb
+*.tflite
+*.joblib
+
+# Logs and temp files
+*.log
+*_log.txt
+streamlit_log.txt
+model_error.txt
+design_output.txt
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+*.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
