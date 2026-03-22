@@ -897,6 +897,108 @@ def preprocess(img: Image.Image, w: int, h: int) -> np.ndarray:
     return np.expand_dims(arr, 0)
 
 
+
+
+
+def remove_annotations(img):
+    import cv2
+    arr = np.array(img.convert("RGB"))
+    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+    red1  = cv2.inRange(hsv, np.array([0,150,100]),   np.array([10,255,255]))
+    red2  = cv2.inRange(hsv, np.array([170,150,100]), np.array([180,255,255]))
+    blue  = cv2.inRange(hsv, np.array([100,150,100]), np.array([130,255,255]))
+    green = cv2.inRange(hsv, np.array([40,150,100]),  np.array([80,255,255]))
+    color_mask = cv2.bitwise_or(cv2.bitwise_or(red1, red2), cv2.bitwise_or(blue, green))
+    gray    = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    edges   = cv2.Canny(gray, 50, 150)
+    kernel  = np.ones((3,3), np.uint8)
+    dilated = cv2.dilate(edges, kernel, iterations=1)
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    shape_mask = np.zeros(gray.shape, dtype=np.uint8)
+    found = False
+    h_img, w_img = gray.shape
+    for cnt in contours:
+        area  = cv2.contourArea(cnt)
+        perim = cv2.arcLength(cnt, True)
+        if perim == 0 or area < 50 or area > 0.4 * h_img * w_img:
+            continue
+        circularity = 4 * np.pi * area / (perim ** 2)
+        if 0.55 < circularity <= 1.25 and area < 8000:
+            cv2.drawContours(shape_mask, [cnt], -1, 255, thickness=cv2.FILLED)
+            found = True
+    combined_mask = cv2.bitwise_or(shape_mask, color_mask)
+    has_annotation = found and int(np.sum(color_mask)) > 1000  # Stricter threshold
+    if not has_annotation:
+        return img, False
+    combined_mask = cv2.dilate(combined_mask, kernel, iterations=3)
+    cleaned = cv2.inpaint(arr, combined_mask, inpaintRadius=7, flags=cv2.INPAINT_TELEA)
+    return Image.fromarray(cleaned), True
+
+
+def tta_predict(model, img: "Image.Image", w: int, h: int, n: int = 10):
+    """Run Test-Time Augmentation — n passes with random flips/rotations."""
+    import cv2
+    arr = np.array(img.convert("RGB").resize((w, h), Image.LANCZOS), dtype=np.float32) / 255.0
+    preds_list = []
+    for _ in range(n):
+        aug = arr.copy()
+        # Random horizontal flip
+        if np.random.rand() > 0.5:
+            aug = aug[:, ::-1, :]
+        # Random vertical flip
+        if np.random.rand() > 0.5:
+            aug = aug[::-1, :, :]
+        # Random 90-degree rotation
+        k = np.random.randint(0, 4)
+        aug = np.rot90(aug, k)
+        # Random brightness shift
+        aug = np.clip(aug + np.random.uniform(-0.05, 0.05), 0, 1)
+        tensor = np.expand_dims(aug, 0)
+        preds_list.append(model.predict(tensor, verbose=0)[0])
+    preds_arr   = np.array(preds_list)          # shape (n, 7)
+    mean_preds  = preds_arr.mean(axis=0)        # average prediction
+    std_preds   = preds_arr.std(axis=0)         # per-class std deviation
+    uncertainty = float(std_preds.max())        # max std = overall uncertainty
+    return mean_preds, uncertainty
+
+
+def preprocess_pipeline(img):
+    """Blur detection, hair removal, lighting correction."""
+    import cv2
+    arr = np.array(img.convert("RGB"))
+    issues = []
+
+    # 1. Blur Detection (Laplacian variance)
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
+    is_blurry = blur_score < 80.0
+    if is_blurry:
+        issues.append(("blur", blur_score))
+
+    # 2. Hair Removal (DullRazor algorithm)
+    kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 17))
+    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel_h)
+    _, hair_mask = cv2.threshold(blackhat, 10, 255, cv2.THRESH_BINARY)
+    hair_pixels = int(np.sum(hair_mask > 0))
+    has_hair = hair_pixels > 500
+    if has_hair:
+        arr = cv2.inpaint(arr, hair_mask, inpaintRadius=6, flags=cv2.INPAINT_TELEA)
+        issues.append(("hair", hair_pixels))
+
+    # 3. Lighting Correction (CLAHE on L channel)
+    lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+    mean_l = float(l.mean())
+    needs_correction = mean_l < 80 or mean_l > 200
+    if needs_correction:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        l = clahe.apply(l)
+        lab = cv2.merge([l, a, b])
+        arr = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+        issues.append(("lighting", mean_l))
+
+    return Image.fromarray(arr), issues, is_blurry
+
 def pill(rk: str, label: str) -> str:
     return f"<span class='pill pill-{rk}'>{label}</span>"
 
@@ -1154,7 +1256,18 @@ elif current_page == "Predict":
             <div class='preview-panel'>
                 <div class='panel-label'>Image Preview</div>
             """, unsafe_allow_html=True)
-            st.image(image, use_container_width=True)
+            
+            p_col1, p_col2 = st.columns(2)
+            with p_col1:
+                st.markdown("**Original Image**")
+                st.image(image, use_container_width=True)
+            with p_col2:
+                st.markdown("**Processed Image**")
+                if "preprocessed_image" in st.session_state:
+                    st.image(st.session_state["preprocessed_image"], use_container_width=True)
+                else:
+                    st.info("Processing preview appears after analysis")
+                    
             st.markdown(f"""
                 <div class='img-meta-strip'>
                     <span>{uploaded.name}</span>
@@ -1166,9 +1279,9 @@ elif current_page == "Predict":
             """, unsafe_allow_html=True)
         else:
             st.markdown("""
-            <div class='preview-panel empty'>
-                <div class='preview-empty-icon'>🔬</div>
-                <div class='preview-empty-text'>Image preview will appear here</div>
+            <div class="preview-panel empty">
+                <div class="preview-empty-icon">🩺</div>
+                <div class="preview-empty-text">Image preview will appear here</div>
             </div>
             """, unsafe_allow_html=True)
 
@@ -1201,8 +1314,25 @@ elif current_page == "Predict":
             t0 = time.perf_counter()
             try:
                 model  = load_model(model_path)
-                tensor = preprocess(image, mw, mh)
-                preds  = model.predict(tensor, verbose=0)[0]
+                clean_image, had_annotation = remove_annotations(image)
+                st.session_state["preprocessed_image"] = clean_image.resize((512, 384), Image.LANCZOS)
+                model_input = clean_image.resize((mw, mh), Image.LANCZOS)
+                # ── P2.3 Pre-Processing Pipeline ──
+                clean_image, pipe_issues, is_blurry = preprocess_pipeline(clean_image)
+                if is_blurry:
+                    st.warning("Image appears blurry (score: " + str(round(pipe_issues[0][1],1)) + "). Results may be unreliable. Please upload a clearer image.")
+                if pipe_issues:
+                    pipe_msgs = []
+                    for tag, val in pipe_issues:
+                        if tag == "hair": pipe_msgs.append("Hair removed (" + str(val) + " px)")
+                        elif tag == "lighting": pipe_msgs.append("Lighting corrected (L=" + str(round(val,1)) + ")")
+                        elif tag == "blur": pipe_msgs.append("Low sharpness detected")
+                    st.markdown('<div style="background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.3);padding:0.5rem 1rem;font-size:0.75rem;color:#FBBF24;margin-bottom:0.75rem;">' + " &nbsp;·&nbsp; ".join(pipe_msgs) + '</div>', unsafe_allow_html=True)
+
+                if had_annotation:
+                    st.success("✔ Drawn annotation detected and removed before analysis")
+                tensor = preprocess(model_input, mw, mh)
+                preds, tta_uncertainty = tta_predict(model, clean_image, mw, mh, n=10)
                 elapsed = time.perf_counter() - t0
             except Exception as e:
                 st.error(f"Inference failed: {e}")
@@ -1266,6 +1396,28 @@ elif current_page == "Predict":
         """, unsafe_allow_html=True)
 
         # Prob + Clinical
+        # ── TTA Uncertainty Badge ──
+        if tta_uncertainty < 0.08:
+            unc_color='#22C55E'; unc_icon='✅'; unc_label='High Confidence'
+            unc_desc='All 10 augmented passes agreed — result is stable.'
+        elif tta_uncertainty < 0.18:
+            unc_color='#F59E0B'; unc_icon='⚠️'; unc_label='Moderate Uncertainty'
+            unc_desc='Some variation across passes — consider a second opinion.'
+        else:
+            unc_color='#EF4444'; unc_icon='🔴'; unc_label='High Uncertainty'
+            unc_desc='High variation — please consult a dermatologist.'
+        st.markdown(
+            f'<div style="background:rgba(0,0,0,0.3);border:1px solid {unc_color}44;'
+            f'border-left:3px solid {unc_color};padding:0.75rem 1.25rem;'
+            f'margin:0.75rem 0;display:flex;align-items:center;gap:1rem;>'
+            f'<span style="font-size:1.3rem">{unc_icon}</span>'
+            f'<div><div style="font-size:0.75rem;font-weight:700;color:{unc_color};'
+            f'text-transform:uppercase;letter-spacing:0.08em">{unc_label}'
+            f' &nbsp;·&nbsp; σ = {tta_uncertainty:.3f}</div>'
+            f'<div style="font-size:0.72rem;color:#64748B;margin-top:0.2rem">{unc_desc}</div>'
+            f'</div></div>',
+            unsafe_allow_html=True)
+
         col_prob, col_clin = st.columns([1, 1], gap="large")
 
         with col_prob:
