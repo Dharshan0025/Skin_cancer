@@ -935,6 +935,41 @@ def remove_annotations(img):
     return Image.fromarray(cleaned), True
 
 
+def detect_blur(img):
+    """Returns True if image is too blurry to analyze"""
+    import cv2
+    gray = cv2.cvtColor(np.array(img.convert('RGB')), cv2.COLOR_RGB2GRAY)
+    variance = cv2.Laplacian(gray, cv2.CV_64F).var()
+    return variance < 50.0, round(variance, 1)
+
+def remove_hair(img):
+    """DullRazor: safe hair removal, preserves skin colors exactly"""
+    import cv2
+    arr = np.array(img.convert('RGB'))
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 17))
+    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+    _, hair_mask = cv2.threshold(blackhat, 10, 255, cv2.THRESH_BINARY)
+    hair_pixel_count = int(np.sum(hair_mask > 0))
+    if hair_pixel_count < 500:
+        return img, False
+    result = cv2.inpaint(arr, hair_mask, 3, cv2.INPAINT_TELEA)
+    return Image.fromarray(result), True
+
+def correct_lighting(img):
+    """Ultra-gentle CLAHE - only brightens dark images"""
+    import cv2
+    arr = np.array(img.convert('RGB'))
+    lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+    avg_brightness = float(np.mean(l))
+    if avg_brightness > 100:
+        return img
+    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(4, 4))
+    l = clahe.apply(l)
+    result = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2RGB)
+    return Image.fromarray(np.clip(result, 0, 255).astype(np.uint8))
+
 def tta_predict(model, img: "Image.Image", w: int, h: int, n: int = 10):
     """Run Test-Time Augmentation — n passes with random flips/rotations."""
     import cv2
@@ -1314,23 +1349,30 @@ elif current_page == "Predict":
             t0 = time.perf_counter()
             try:
                 model  = load_model(model_path)
-                clean_image, had_annotation = remove_annotations(image)
-                st.session_state["preprocessed_image"] = clean_image.resize((512, 384), Image.LANCZOS)
-                model_input = clean_image.resize((mw, mh), Image.LANCZOS)
-                # ── P2.3 Pre-Processing Pipeline ──
-                clean_image, pipe_issues, is_blurry = preprocess_pipeline(clean_image)
+                # BLUR CHECK
+                is_blurry, blur_score = detect_blur(image)
                 if is_blurry:
-                    st.warning("Image appears blurry (score: " + str(round(pipe_issues[0][1],1)) + "). Results may be unreliable. Please upload a clearer image.")
-                if pipe_issues:
-                    pipe_msgs = []
-                    for tag, val in pipe_issues:
-                        if tag == "hair": pipe_msgs.append("Hair removed (" + str(val) + " px)")
-                        elif tag == "lighting": pipe_msgs.append("Lighting corrected (L=" + str(round(val,1)) + ")")
-                        elif tag == "blur": pipe_msgs.append("Low sharpness detected")
-                    st.markdown('<div style="background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.3);padding:0.5rem 1rem;font-size:0.75rem;color:#FBBF24;margin-bottom:0.75rem;">' + " &nbsp;·&nbsp; ".join(pipe_msgs) + '</div>', unsafe_allow_html=True)
-
+                    st.error(f"⚠️ Image too blurry (sharpness: {blur_score}) — upload a clearer photo for accurate results.")
+                    st.stop()
+            
+                # ANNOTATION REMOVAL
+                clean_image, had_annotation = remove_annotations(image)
                 if had_annotation:
-                    st.success("✔ Drawn annotation detected and removed before analysis")
+                    st.markdown('<div style="background:rgba(0,194,255,0.08);border:1px solid rgba(0,194,255,0.3);padding:0.5rem 1rem;font-size:0.75rem;color:#00C2FF;margin-bottom:0.75rem">✔ Drawn annotation detected and removed before analysis</div>', unsafe_allow_html=True)
+            
+                # HAIR REMOVAL
+                clean_image, hair_removed = remove_hair(clean_image)
+                if hair_removed:
+                    st.markdown('<div style="background:rgba(34,197,94,0.08);border:1px solid rgba(34,197,94,0.3);padding:0.5rem 1rem;font-size:0.75rem;color:#4ADE80;margin-bottom:0.75rem">✂️ Hair detected and removed for cleaner analysis</div>', unsafe_allow_html=True)
+            
+                # LIGHTING CORRECTION
+                clean_image = correct_lighting(clean_image)
+            
+                # SAVE CRISP PREVIEW (512x384 for display)
+                st.session_state["preprocessed_image"] = clean_image.resize((512, 384), Image.LANCZOS)
+            
+                # MODEL INPUT
+                model_input = clean_image.resize((mw, mh), Image.LANCZOS)
                 tensor = preprocess(model_input, mw, mh)
                 preds, tta_uncertainty = tta_predict(model, clean_image, mw, mh, n=10)
                 elapsed = time.perf_counter() - t0
