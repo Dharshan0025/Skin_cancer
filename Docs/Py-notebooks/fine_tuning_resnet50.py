@@ -122,13 +122,19 @@ model.summary()
 
 learning_rate_reduction = ReduceLROnPlateau(monitor='val_acc', patience=3, verbose=1, factor=0.5,
                                             min_lr=0.000001, cooldown=3)
+early_stopping = EarlyStopping(
+    monitor='val_acc',
+    patience=5,
+    restore_best_weights=True,
+    verbose=1
+)
 
 batch_size = 64
 epochs = 30
 history = model.fit_generator(train_datagen.flow(X_train,y_train, batch_size=batch_size),
                               epochs = epochs, validation_data = val_datagen.flow(X_val, y_val),
                               verbose = 1, steps_per_epoch=(X_train.shape[0] // batch_size),
-                              validation_steps=(X_val.shape[0] // batch_size), callbacks=[learning_rate_reduction])
+                              validation_steps=(X_val.shape[0] // batch_size), callbacks=[learning_rate_reduction, early_stopping])
 
 loss_val, acc_val = model.evaluate(X_val, y_val, verbose=1)
 print("Validation: accuracy = %f  ;  loss_v = %f" % (acc_val, loss_val))

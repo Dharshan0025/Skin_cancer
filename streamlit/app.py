@@ -811,6 +811,49 @@ html, body, [class*="css"], .stApp {
 [data-testid="stSidebar"] { display: none !important; }
 [data-testid="collapsedControl"] { display: none !important; }
 
+/* ══════════════════════════════════════════════════════════════════════════
+   MOBILE RESPONSIVE BREAKPOINTS
+══════════════════════════════════════════════════════════════════════════ */
+@media (max-width: 1024px) {
+    .cond-strip { grid-template-columns: repeat(4, 1fr); }
+}
+
+@media (max-width: 768px) {
+    .metrics-strip { flex-wrap: wrap; gap: 0.5rem; display: flex; }
+    .metrics-strip > div { min-width: 45%; flex: 1; }
+    
+    [data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; }
+    [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] { 
+      min-width: 48% !important; 
+      flex: 1 1 48% !important;
+    }
+}
+
+@media (max-width: 640px) {
+    .cond-strip { grid-template-columns: repeat(2, 1fr); }
+    
+    .result-hero h1, .result-hero .result-name { font-size: 1.4rem; }
+    .result-hero .result-conf { font-size: 2rem; }
+    
+    .main .block-container, .hero { 
+      padding: 1rem !important; 
+      max-width: 100% !important; 
+    }
+    
+    .topbar { flex-direction: column; gap: 0.5rem; padding: 0.75rem; height: auto; }
+    .topbar-nav { flex-wrap: wrap; justify-content: center; }
+    .topbar-right { display: none; }
+}
+
+@media (max-width: 480px) {
+    .metrics-strip > div { min-width: 100%; }
+    
+    [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] { 
+      min-width: 100% !important; 
+      flex: 1 1 100% !important;
+    }
+}
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -919,7 +962,10 @@ def safe_predict(model, tensor):
         for layer in model.layers:
             if isinstance(layer, tf.keras.Model):
                 sub_preds.append(layer.predict(tensor, verbose=0))
-        if sub_preds:
+        if len(sub_preds) == 2:
+            # Weighted ensemble: DenseNet201-FT (0.40) + InceptionV3-FT (0.60)
+            return sub_preds[0] * 0.40 + sub_preds[1] * 0.60
+        elif sub_preds:
             return sum(sub_preds) / len(sub_preds)
         raise
 
@@ -967,36 +1013,232 @@ def remove_annotations(img):
     return Image.fromarray(cleaned), True
 
 
-def generate_gradcam_overlay(model, img_pil, model_w, model_h, pred_index):
-    """Gradient Saliency — works with ALL Keras 3 models, no layer hacks needed"""
+def generate_gradcam_overlay(model, img_pil, model_w, model_h, pred_index=None):
+    """True Grad-CAM — auto-detects last Conv2D layer; falls back to gradient saliency."""
     import cv2
     import tensorflow as tf
     try:
         arr = np.array(
             img_pil.convert('RGB').resize((model_w, model_h), Image.LANCZOS),
             dtype=np.float32) / 255.0
-        input_var = tf.Variable(arr[np.newaxis, ...])
+        tensor = np.expand_dims(arr, 0)
+
+        # AUTO-DETECT last Conv2D layer — no hardcoded names
+        last_conv_layer = None
+        for layer in reversed(model.layers):
+            if isinstance(layer, tf.keras.layers.Conv2D):
+                last_conv_layer = layer
+                break
+
+        # If no Conv2D found, raise to trigger saliency fallback
+        if last_conv_layer is None:
+            raise ValueError("No Conv2D layer found — using saliency fallback")
+
+        # Build grad model: inputs → [last_conv_output, final_output]
+        grad_model = tf.keras.Model(
+            inputs=model.inputs,
+            outputs=[last_conv_layer.output, model.output]
+        )
+
+        # GradientTape watching conv layer output
+        tensor_tf = tf.cast(tensor, tf.float32)
         with tf.GradientTape() as tape:
-            preds = model(input_var, training=False)
-            loss = preds[:, pred_index]
-        grads = tape.gradient(loss, input_var)
-        if grads is None:
-            return None
-        saliency = tf.reduce_max(tf.abs(grads), axis=-1)[0].numpy()
-        s_min, s_max = saliency.min(), saliency.max()
-        if s_max - s_min < 1e-8:
-            return None
-        saliency = (saliency - s_min) / (s_max - s_min)
-        orig_arr = np.array(img_pil.convert('RGB'))
-        h, w = orig_arr.shape[:2]
-        heatmap = cv2.resize(saliency, (w, h))
-        heatmap_colored = cv2.applyColorMap(
-            np.uint8(255 * heatmap), cv2.COLORMAP_JET)
+            conv_outputs, predictions = grad_model(tensor_tf)
+            tape.watch(conv_outputs)
+            if pred_index is None:
+                pred_index = int(tf.argmax(predictions[0]))
+            class_score = predictions[:, pred_index]
+
+        # Gradients of class score w.r.t. conv feature maps
+        grads = tape.gradient(class_score, conv_outputs)
+
+        # Global average pool gradients → importance weights per channel
+        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+
+        # Weight each feature map by its gradient importance
+        conv_outputs_np = conv_outputs[0].numpy()
+        pooled_grads_np = pooled_grads.numpy()
+        for i in range(pooled_grads_np.shape[-1]):
+            conv_outputs_np[:, :, i] *= pooled_grads_np[i]
+
+        # Mean across channels + ReLU + normalize
+        heatmap = np.mean(conv_outputs_np, axis=-1)
+        heatmap = np.maximum(heatmap, 0)
+        heatmap = heatmap / (np.max(heatmap) + 1e-8)
+
+        # Resize heatmap to original image size and colorize
+        orig_w, orig_h = img_pil.size
+        heatmap_resized = cv2.resize(heatmap, (orig_w, orig_h))
+        heatmap_uint8 = np.uint8(255 * heatmap_resized)
+        heatmap_colored = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
         heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
+
+        # Overlay on ORIGINAL image (not preprocessed)
+        orig_arr = np.array(img_pil.convert('RGB'))
         overlay = cv2.addWeighted(orig_arr, 0.55, heatmap_colored, 0.45, 0)
         return Image.fromarray(overlay)
+
     except Exception:
-        return None
+        # Fallback: gradient saliency — works with ALL Keras 3 models
+        try:
+            arr = np.array(
+                img_pil.convert('RGB').resize((model_w, model_h), Image.LANCZOS),
+                dtype=np.float32) / 255.0
+            input_var = tf.Variable(arr[np.newaxis, ...])
+            with tf.GradientTape() as tape:
+                preds = model(input_var, training=False)
+                loss = preds[:, pred_index] if pred_index is not None else tf.reduce_max(preds)
+            grads = tape.gradient(loss, input_var)
+            if grads is None:
+                return None
+            saliency = tf.reduce_max(tf.abs(grads), axis=-1)[0].numpy()
+            s_min, s_max = saliency.min(), saliency.max()
+            if s_max - s_min < 1e-8:
+                return None
+            saliency = (saliency - s_min) / (s_max - s_min)
+            orig_arr = np.array(img_pil.convert('RGB'))
+            h, w = orig_arr.shape[:2]
+            heatmap = cv2.resize(saliency, (w, h))
+            heatmap_colored = cv2.applyColorMap(
+                np.uint8(255 * heatmap), cv2.COLORMAP_JET)
+            heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
+            overlay = cv2.addWeighted(orig_arr, 0.55, heatmap_colored, 0.45, 0)
+            return Image.fromarray(overlay)
+        except Exception:
+            return None
+
+
+def generate_pdf_report(class_label, confidence, uncertainty, model_name,
+                         preds, class_labels, gradcam_img, preprocessed_img):
+    """Generate a PDF diagnostic report and return raw bytes."""
+    from fpdf import FPDF
+    import tempfile, os
+
+    # top_idx resolved locally so the probability table can bold the top class
+    import numpy as _np
+    top_idx_local = int(_np.argmax(list(preds)))
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    def clean_text(text):
+        if not isinstance(text, str):
+            from numbers import Number
+            if isinstance(text, Number): 
+                return str(text)
+            text = str(text)
+        # fpdf uses latin-1, replace common unicode chars that fail
+        return text.replace("—", "-").replace("·", "-").replace("🔴", "").replace("🟡", "").replace("🔵", "").replace("✅", "").replace("⚠️", "").replace("σ", "SD").encode('latin-1', 'replace').decode('latin-1')
+
+    # ── HEADER ──────────────────────────────────────────────────────────────
+    pdf.set_font("Helvetica", "B", 20)
+    pdf.set_text_color(30, 30, 30)
+    pdf.cell(0, 12, clean_text("DermAI - Skin Lesion Analysis Report"), ln=True, align="C")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(100, 100, 100)
+    pdf.cell(0, 6, clean_text(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"),
+             ln=True, align="C")
+    pdf.ln(4)
+
+    # ── DISCLAIMER BOX ──────────────────────────────────────────────────────
+    pdf.set_fill_color(254, 242, 242)
+    pdf.set_draw_color(220, 38, 38)
+    pdf.set_text_color(153, 27, 27)
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.multi_cell(0, 7,
+        clean_text("DISCLAIMER: This report is NOT a medical diagnosis. "
+        "DermAI is an AI research tool for educational purposes only. "
+        "Always consult a qualified dermatologist for medical advice."),
+        border=1, fill=True, align="C")
+    pdf.ln(6)
+
+    # ── PRIMARY DIAGNOSIS ───────────────────────────────────────────────────
+    pdf.set_text_color(30, 30, 30)
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 10, clean_text("Primary Diagnosis"), ln=True)
+    pdf.set_draw_color(200, 200, 200)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(3)
+
+    unc_level = ('High' if uncertainty >= 0.18
+                 else 'Moderate' if uncertainty >= 0.08
+                 else 'Low')
+    rows = [
+        ("Diagnosis",       class_label),
+        ("Confidence",      f"{confidence:.1f}%"),
+        ("TTA Uncertainty", f"{uncertainty:.4f} ({unc_level})"),
+        ("Model Used",      str(model_name).replace("—", "-").replace("·", "-")),
+        ("Report Date",     datetime.now().strftime('%Y-%m-%d')),
+    ]
+    for lbl, val in rows:
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(60, 8, clean_text(lbl + ":"), ln=False)
+        pdf.set_font("Helvetica", "", 10)
+        pdf.cell(0, 8, clean_text(val), ln=True)
+    pdf.ln(6)
+
+    # ── CLASS PROBABILITY TABLE ─────────────────────────────────────────────
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 10, clean_text("Class Probability Breakdown"), ln=True)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(3)
+
+    pdf.set_fill_color(240, 240, 240)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(120, 8, clean_text("Diagnosis Class"), border=1, fill=True)
+    pdf.cell(0,   8, clean_text("Probability"),     border=1, fill=True, ln=True)
+
+    sorted_preds = sorted(enumerate(preds), key=lambda x: x[1], reverse=True)
+    for idx, prob in sorted_preds:
+        pdf.set_font("Helvetica", "B" if idx == top_idx_local else "", 10)
+        pdf.cell(120, 7, clean_text(class_labels[idx]), border=1)
+        pdf.cell(0,   7, clean_text(f"{prob * 100:.2f}%"), border=1, ln=True)
+    pdf.ln(6)
+
+    # ── PREPROCESSING PIPELINE ──────────────────────────────────────────────
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 10, clean_text("Preprocessing Pipeline Applied"), ln=True)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(3)
+    pdf.set_font("Helvetica", "", 10)
+    for step in [
+        "Blur Detection",
+        "Annotation Removal",
+        "Hair Removal (DullRazor)",
+        "Lighting Normalization (CLAHE)",
+        "10-Pass Test-Time Augmentation (TTA)",
+    ]:
+        pdf.cell(0, 7, clean_text(f"  +  {step}"), ln=True)
+    pdf.ln(6)
+
+    # ── PAGE 2: GRAD-CAM IMAGE ──────────────────────────────────────────────
+    if gradcam_img is not None:
+        pdf.add_page()
+        pdf.set_font("Helvetica", "B", 14)
+        pdf.set_text_color(30, 30, 30)
+        pdf.cell(0, 10, clean_text("AI Explainability - Grad-CAM Heatmap"), ln=True)
+        pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+        pdf.ln(3)
+        pdf.set_font("Helvetica", "", 9)
+        pdf.set_text_color(100, 100, 100)
+        pdf.multi_cell(0, 6,
+            clean_text("The heatmap shows which regions the AI focused on when making "
+            "its prediction. Red/yellow areas indicate high activation."))
+
+        pdf.ln(4)
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                gradcam_img.save(tmp.name)
+                tmp_path = tmp.name
+            pdf.image(tmp_path, x=25, w=160)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    return bytes(pdf.output())
+
 
 def detect_blur(img):
     """Returns True if image is too blurry to analyze"""
@@ -1059,7 +1301,8 @@ def tta_predict(model, img: "Image.Image", w: int, h: int, n: int = 10, model2=N
         if model2 is not None:
             p1 = model.predict(tensor, verbose=0)[0]
             p2 = model2.predict(tensor, verbose=0)[0]
-            preds_list.append((p1 + p2) / 2.0)
+            # Weighted ensemble: DenseNet201-FT (0.40) + InceptionV3-FT (0.60)
+            preds_list.append(p1 * 0.40 + p2 * 0.60)
         else:
             preds_list.append(model.predict(tensor, verbose=0)[0])
     preds_arr   = np.array(preds_list)          # shape (n, 7)
@@ -1117,13 +1360,16 @@ def ensure_models() -> None:
     if missing:
         try:
             from huggingface_hub import hf_hub_download
-            bar = st.sidebar.progress(0, text="Downloading models…")
-            for i, f in enumerate(missing):
-                hf_hub_download(repo_id=HF_MODEL_REPO, filename=f, local_dir=MODELS_DIR)
-                bar.progress((i + 1) / len(missing), text=f"Downloaded {f}")
-            bar.empty()
+            with st.status(f"⬇️ Downloading {len(missing)} model(s)…", expanded=True) as status:
+                bar = st.progress(0)
+                for i, f in enumerate(missing):
+                    st.write(f"Fetching `{f}` from HuggingFace…")
+                    hf_hub_download(repo_id=HF_MODEL_REPO, filename=f, local_dir=MODELS_DIR)
+                    bar.progress((i + 1) / len(missing), text=f"✓ {f}")
+                status.update(label="✅ All models ready!", state="complete", expanded=False)
+                bar.empty()
         except Exception as e:
-            st.sidebar.warning(f"Download failed: {e}")
+            st.warning(f"⚠️ Model download failed: {e}")
     st.session_state["_ready"] = True
 
 
@@ -1345,7 +1591,7 @@ elif current_page == "Predict":
         <div class='upload-zone'>
             <div class='upload-icon'>⬆</div>
             <div class='upload-title'>Drop or Browse</div>
-            <div class='upload-hint'>JPG · PNG · BMP · TIFF · up to 200 MB</div>
+            <div class='upload-hint'>JPG · PNG · BMP · TIFF · up to 10 MB</div>
         </div>
         """, unsafe_allow_html=True)
         uploaded = st.file_uploader(
@@ -1354,9 +1600,25 @@ elif current_page == "Predict":
             label_visibility="collapsed",
         )
 
+    # ── Upload validation ──────────────────────────────────────────────────────
+    if uploaded is not None:
+        if uploaded.size > 10 * 1024 * 1024:
+            st.error("⚠️ File too large. Please upload an image under 10 MB.")
+            st.stop()
+        if uploaded.size == 0:
+            st.error("⚠️ Uploaded file appears to be empty or corrupted.")
+            st.stop()
+        try:
+            _img_check = Image.open(uploaded)
+            _img_check.verify()          # Exhausts stream — must seek(0) after
+            uploaded.seek(0)             # Reset stream pointer before real open
+        except Exception:
+            st.error("⚠️ Could not read this image. Please upload a valid JPG or PNG.")
+            st.stop()
+
     with col_prev:
         if uploaded is not None:
-            image = Image.open(uploaded)
+            image = Image.open(uploaded)  # Safe: stream reset by seek(0) above
             iw, ih = image.size
             size_kb = uploaded.size / 1024
             st.markdown("""
@@ -1453,7 +1715,9 @@ elif current_page == "Predict":
                 tensor = preprocess(model_input, mw, mh)
                 preds, tta_uncertainty = tta_predict(model, clean_image, mw, mh, n=10, model2=model2)
                 try:
-                    gradcam_img = generate_gradcam_overlay(model, clean_image, mw, mh, int(np.argmax(preds)))
+                    # For ensemble, always use DenseNet201 (primary model) for Grad-CAM
+                    primary_model = model[0] if isinstance(model, tuple) else model
+                    gradcam_img = generate_gradcam_overlay(primary_model, clean_image, mw, mh, int(np.argmax(preds)))
                 except Exception:
                     gradcam_img = None
                 st.session_state["gradcam_image"] = gradcam_img
@@ -1542,7 +1806,30 @@ elif current_page == "Predict":
             f'</div></div>',
             unsafe_allow_html=True)
 
-        # ── Grad-CAM Section ──────────────────────────────────
+        # ── PDF Report Download ───────────────────────────────────────────────
+        try:
+            pdf_bytes = generate_pdf_report(
+                class_label      = CLASS_LABELS[top_idx],
+                confidence       = top_conf,
+                uncertainty      = tta_uncertainty,
+                model_name       = sel_model_name,
+                preds            = preds,
+                class_labels     = CLASS_LABELS,
+                gradcam_img      = st.session_state.get("gradcam_image"),
+                preprocessed_img = st.session_state.get("preprocessed_image"),
+            )
+            st.download_button(
+                label               = "📄 Download Diagnosis Report (PDF)",
+                data                = pdf_bytes,
+                file_name           = f"DermAI_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                mime                = "application/pdf",
+                use_container_width = True,
+            )
+        except Exception as _pdf_err:
+            print(f"PDF GENERATION ERROR: {_pdf_err}")
+            st.caption(f"PDF generation unavailable: {_pdf_err}")
+
+
         st.markdown('<div class="zone-label">🔬 AI Explainability — Grad-CAM</div>', unsafe_allow_html=True)
         gcam = st.session_state.get("gradcam_image", None)
         if gcam is not None:
@@ -1577,6 +1864,15 @@ elif current_page == "Predict":
                     similar_cases = engine.find_similar(image, top_k=5)
                     if similar_cases:
                         st.info(f"🎯 Found {len(similar_cases)} visual matches")
+                        _CBIR_BADGE_COLORS = {
+                            'Melanoma':              ('#dc2626', '#fff'),
+                            'Basal Cell Carcinoma':  ('#dc2626', '#fff'),
+                            'Actinic Keratosis':     ('#b45309', '#fff'),
+                            'Benign Keratosis':      ('#0284c7', '#fff'),
+                            'Dermatofibroma':        ('#0369a1', '#fff'),
+                            'Vascular Lesion':       ('#7c3aed', '#fff'),
+                            'Melanocytic Nevi':      ('#16a34a', '#fff'),
+                        }
                         for i, case in enumerate(similar_cases):
                             col1, col2 = st.columns([1, 3])
                             with col1:
@@ -1585,8 +1881,19 @@ elif current_page == "Predict":
                                 else:
                                     st.markdown("🖼️", unsafe_allow_html=True)
                             with col2:
-                                st.metric("Similarity", f"{case['similarity']:.1%}")
-                                st.caption(f"{case['diagnosis']} · {case['image_id']}")
+                                diag  = case.get('diagnosis', 'Unknown')
+                                sim   = case.get('similarity', 0.0)
+                                bg, fg = _CBIR_BADGE_COLORS.get(diag, ('#6b7280', '#fff'))
+                                st.markdown(
+                                    f"<span style='background:{bg};color:{fg};"
+                                    f"padding:3px 10px;border-radius:12px;"
+                                    f"font-size:0.82em;font-weight:600;'>"
+                                    f"{diag}</span>"
+                                    f"&nbsp;&nbsp;<span style='font-size:1.1em;"
+                                    f"font-weight:700;color:#f1f5f9;'>{sim:.1%}</span>",
+                                    unsafe_allow_html=True,
+                                )
+                                st.caption(case.get('image_id', ''))
                     else:
                         st.warning("No similar cases found")
                 else:

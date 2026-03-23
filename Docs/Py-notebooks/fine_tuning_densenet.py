@@ -145,6 +145,35 @@ y_test = to_categorical(y_test)
 loss_test, acc_test = model.evaluate(X_test, y_test, verbose=1)
 print("Test: accuracy = %f  ;  loss = %f" % (acc_test, loss_test))
 
+# ── Per-class metrics (F1 / Precision / Recall / Confusion Matrix) ─────────
+CLASS_NAMES = [
+    'Actinic Keratosis', 'Basal Cell Carcinoma', 'Benign Keratosis',
+    'Dermatofibroma', 'Melanoma', 'Melanocytic Nevi', 'Vascular Lesion'
+]
+from sklearn.metrics import classification_report, confusion_matrix
+import seaborn as sns
+
+y_pred_probs = model.predict(X_test)
+y_pred = np.argmax(y_pred_probs, axis=1)
+y_true = np.argmax(y_test, axis=1)  # y_test is one-hot encoded
+
+print("\n=== Classification Report ===")
+print(classification_report(y_true, y_pred, target_names=CLASS_NAMES))
+
+cm = confusion_matrix(y_true, y_pred)
+plt.figure(figsize=(10, 8))
+sns.heatmap(cm, annot=True, fmt='d',
+            xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES,
+            cmap='Blues')
+plt.title('Confusion Matrix — DenseNet201 Finetuned')
+plt.ylabel('True Label')
+plt.xlabel('Predicted Label')
+plt.xticks(rotation=45, ha='right')
+plt.tight_layout()
+plt.savefig('confusion_matrix_densenet_finetuned.png', dpi=150)
+plt.show()
+# ───────────────────────────────────────────────────────────────────────────
+
 model.save("/kaggle/working/DenseNetFT.h5")
 print("Model saved to /kaggle/working/DenseNetFT.h5")
 

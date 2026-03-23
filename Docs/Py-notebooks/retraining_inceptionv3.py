@@ -125,6 +125,12 @@ model.compile(loss='categorical_crossentropy',
 
 learning_rate_reduction = ReduceLROnPlateau(monitor='val_acc', patience=3, verbose=1, factor=0.5,
                                             min_lr=0.000001, cooldown=2)
+early_stopping = EarlyStopping(
+    monitor='val_acc',
+    patience=5,
+    restore_best_weights=True,
+    verbose=1
+)
 
 model.summary()
 
@@ -134,7 +140,7 @@ history = model.fit_generator(train_datagen.flow(X_train,y_train, batch_size=bat
                               epochs = epochs, validation_data = val_datagen.flow(X_val, y_val),
                               verbose = 1, steps_per_epoch=(X_train.shape[0] // batch_size),
                               validation_steps=(X_val.shape[0] // batch_size),
-                              callbacks=[learning_rate_reduction])
+                              callbacks=[learning_rate_reduction, early_stopping])
 
 loss_val, acc_val = model.evaluate(X_val, y_val, verbose=1)
 print("Validation: accuracy = %f  ;  loss_v = %f" % (acc_val, loss_val))
@@ -153,6 +159,35 @@ y_test = to_categorical(y_test)
 
 loss_test, acc_test = model.evaluate(X_test, y_test, verbose=1)
 print("Test: accuracy = %f  ;  loss = %f" % (acc_test, loss_test))
+
+# ── Per-class metrics (F1 / Precision / Recall / Confusion Matrix) ─────────
+CLASS_NAMES = [
+    'Actinic Keratosis', 'Basal Cell Carcinoma', 'Benign Keratosis',
+    'Dermatofibroma', 'Melanoma', 'Melanocytic Nevi', 'Vascular Lesion'
+]
+from sklearn.metrics import classification_report, confusion_matrix
+import seaborn as sns
+
+y_pred_probs = model.predict(X_test)
+y_pred = np.argmax(y_pred_probs, axis=1)
+y_true = np.argmax(y_test, axis=1)  # y_test is one-hot encoded
+
+print("\n=== Classification Report ===")
+print(classification_report(y_true, y_pred, target_names=CLASS_NAMES))
+
+cm = confusion_matrix(y_true, y_pred)
+plt.figure(figsize=(10, 8))
+sns.heatmap(cm, annot=True, fmt='d',
+            xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES,
+            cmap='Blues')
+plt.title('Confusion Matrix — InceptionV3 Retrained')
+plt.ylabel('True Label')
+plt.xlabel('Predicted Label')
+plt.xticks(rotation=45, ha='right')
+plt.tight_layout()
+plt.savefig('confusion_matrix_inceptionv3_retrained.png', dpi=150)
+plt.show()
+# ───────────────────────────────────────────────────────────────────────────
 
 """Achieving test accuracy of 86.8% after 20 training epochs is a good result! This experiment proved that the architecture and the weights of Inception trained on ImageNet help learning for a complete different domain dataset."""
 
