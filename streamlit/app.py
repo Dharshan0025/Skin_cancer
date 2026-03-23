@@ -1568,6 +1568,32 @@ elif current_page == "Predict":
                 unsafe_allow_html=True)
         st.markdown('<div class="zone-divider"></div>', unsafe_allow_html=True)
 
+        # CBIR Similar Cases - P2.1
+        try:
+            from cbir_engine import init_cbir
+            with st.expander("🔍 Similar Cases (CBIR)", expanded=False):
+                engine = init_cbir()
+                if engine.load_index():
+                    similar_cases = engine.find_similar(image, top_k=5)
+                    if similar_cases:
+                        st.info(f"🎯 Found {len(similar_cases)} visual matches")
+                        for i, case in enumerate(similar_cases):
+                            col1, col2 = st.columns([1, 3])
+                            with col1:
+                                if case.get('path') and os.path.exists(case['path']):
+                                    st.image(case['path'], width=100)
+                                else:
+                                    st.markdown("🖼️", unsafe_allow_html=True)
+                            with col2:
+                                st.metric("Similarity", f"{case['similarity']:.1%}")
+                                st.caption(f"{case['diagnosis']} · {case['image_id']}")
+                    else:
+                        st.warning("No similar cases found")
+                else:
+                    st.info("📥 Build CBIR index first: streamlit run build_cbir_index.py")
+        except Exception as e:
+            st.error(f"CBIR Module Error: {str(e)}")
+
         col_prob, col_clin = st.columns([1, 1], gap="large")
 
         with col_prob:
