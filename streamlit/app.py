@@ -889,7 +889,39 @@ NAV_PAGES = ["Home", "Predict", "Models"]
 @st.cache_resource(show_spinner=False)
 def load_model(path: str):
     import tensorflow as tf
-    return tf.keras.models.load_model(path, compile=False)
+    import logging
+    logging.getLogger('tensorflow').setLevel(logging.ERROR)
+    import os
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+    import keras
+    keras.config.enable_unsafe_deserialization()
+    return tf.keras.models.load_model(path, compile=False, safe_mode=False)
+
+@st.cache_resource(show_spinner=False)
+def load_ensemble(models_dir):
+    import os
+    import tensorflow as tf
+    m1 = tf.keras.models.load_model(
+        os.path.join(models_dir, "DenseNet201_finetuned.h5"),
+        compile=False, safe_mode=False)
+    m2 = tf.keras.models.load_model(
+        os.path.join(models_dir, "InceptionV3_finetuned.h5"),
+        compile=False, safe_mode=False)
+    return m1, m2
+
+def safe_predict(model, tensor):
+    """Handles Ensemble Lambda output_shape issue in Keras 3"""
+    import tensorflow as tf
+    try:
+        return model.predict(tensor, verbose=0)
+    except Exception:
+        sub_preds = []
+        for layer in model.layers:
+            if isinstance(layer, tf.keras.Model):
+                sub_preds.append(layer.predict(tensor, verbose=0))
+        if sub_preds:
+            return sum(sub_preds) / len(sub_preds)
+        raise
 
 
 def preprocess(img: Image.Image, w: int, h: int) -> np.ndarray:
@@ -935,6 +967,37 @@ def remove_annotations(img):
     return Image.fromarray(cleaned), True
 
 
+def generate_gradcam_overlay(model, img_pil, model_w, model_h, pred_index):
+    """Gradient Saliency — works with ALL Keras 3 models, no layer hacks needed"""
+    import cv2
+    import tensorflow as tf
+    try:
+        arr = np.array(
+            img_pil.convert('RGB').resize((model_w, model_h), Image.LANCZOS),
+            dtype=np.float32) / 255.0
+        input_var = tf.Variable(arr[np.newaxis, ...])
+        with tf.GradientTape() as tape:
+            preds = model(input_var, training=False)
+            loss = preds[:, pred_index]
+        grads = tape.gradient(loss, input_var)
+        if grads is None:
+            return None
+        saliency = tf.reduce_max(tf.abs(grads), axis=-1)[0].numpy()
+        s_min, s_max = saliency.min(), saliency.max()
+        if s_max - s_min < 1e-8:
+            return None
+        saliency = (saliency - s_min) / (s_max - s_min)
+        orig_arr = np.array(img_pil.convert('RGB'))
+        h, w = orig_arr.shape[:2]
+        heatmap = cv2.resize(saliency, (w, h))
+        heatmap_colored = cv2.applyColorMap(
+            np.uint8(255 * heatmap), cv2.COLORMAP_JET)
+        heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
+        overlay = cv2.addWeighted(orig_arr, 0.55, heatmap_colored, 0.45, 0)
+        return Image.fromarray(overlay)
+    except Exception:
+        return None
+
 def detect_blur(img):
     """Returns True if image is too blurry to analyze"""
     import cv2
@@ -970,7 +1033,7 @@ def correct_lighting(img):
     result = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2RGB)
     return Image.fromarray(np.clip(result, 0, 255).astype(np.uint8))
 
-def tta_predict(model, img: "Image.Image", w: int, h: int, n: int = 10):
+def tta_predict(model, img: "Image.Image", w: int, h: int, n: int = 10, model2=None):
     """Run Test-Time Augmentation — n passes with random flips/rotations."""
     import cv2
     arr = np.array(img.convert("RGB").resize((w, h), Image.LANCZOS), dtype=np.float32) / 255.0
@@ -986,10 +1049,19 @@ def tta_predict(model, img: "Image.Image", w: int, h: int, n: int = 10):
         # Random 90-degree rotation
         k = np.random.randint(0, 4)
         aug = np.rot90(aug, k)
+        if aug.shape[0] != h or aug.shape[1] != w:
+            aug = np.array(
+                Image.fromarray((aug * 255).astype(np.uint8)).resize((w, h), Image.LANCZOS),
+                dtype=np.float32) / 255.0
         # Random brightness shift
         aug = np.clip(aug + np.random.uniform(-0.05, 0.05), 0, 1)
         tensor = np.expand_dims(aug, 0)
-        preds_list.append(model.predict(tensor, verbose=0)[0])
+        if model2 is not None:
+            p1 = model.predict(tensor, verbose=0)[0]
+            p2 = model2.predict(tensor, verbose=0)[0]
+            preds_list.append((p1 + p2) / 2.0)
+        else:
+            preds_list.append(model.predict(tensor, verbose=0)[0])
     preds_arr   = np.array(preds_list)          # shape (n, 7)
     mean_preds  = preds_arr.mean(axis=0)        # average prediction
     std_preds   = preds_arr.std(axis=0)         # per-class std deviation
@@ -1348,7 +1420,12 @@ elif current_page == "Predict":
         with st.spinner(f"Running inference with {sel_model_name}…"):
             t0 = time.perf_counter()
             try:
-                model  = load_model(model_path)
+                is_ensemble = sel_model_name == "Ensemble (DenseNet201 + InceptionV3)"
+                if is_ensemble:
+                    model, model2 = load_ensemble(MODELS_DIR)
+                else:
+                    model = load_model(model_path)
+                    model2 = None
                 # BLUR CHECK
                 is_blurry, blur_score = detect_blur(image)
                 if is_blurry:
@@ -1374,7 +1451,12 @@ elif current_page == "Predict":
                 # MODEL INPUT
                 model_input = clean_image.resize((mw, mh), Image.LANCZOS)
                 tensor = preprocess(model_input, mw, mh)
-                preds, tta_uncertainty = tta_predict(model, clean_image, mw, mh, n=10)
+                preds, tta_uncertainty = tta_predict(model, clean_image, mw, mh, n=10, model2=model2)
+                try:
+                    gradcam_img = generate_gradcam_overlay(model, clean_image, mw, mh, int(np.argmax(preds)))
+                except Exception:
+                    gradcam_img = None
+                st.session_state["gradcam_image"] = gradcam_img
                 elapsed = time.perf_counter() - t0
             except Exception as e:
                 st.error(f"Inference failed: {e}")
@@ -1459,6 +1541,32 @@ elif current_page == "Predict":
             f'<div style="font-size:0.72rem;color:#64748B;margin-top:0.2rem">{unc_desc}</div>'
             f'</div></div>',
             unsafe_allow_html=True)
+
+        # ── Grad-CAM Section ──────────────────────────────────
+        st.markdown('<div class="zone-label">🔬 AI Explainability — Grad-CAM</div>', unsafe_allow_html=True)
+        gcam = st.session_state.get("gradcam_image", None)
+        if gcam is not None:
+            gc1, gc2 = st.columns(2)
+            with gc1:
+                st.markdown("**Original Image**")
+                st.image(clean_image, use_container_width=True)
+            with gc2:
+                st.markdown("**AI Focus Heatmap**")
+                st.image(gcam, use_container_width=True)
+            st.markdown(
+                '<div style="font-size:0.72rem;color:#475569;padding:0.5rem 0.75rem;'
+                'background:#0A0F1A;border:1px solid #0E1420;margin-bottom:0.75rem">'
+                '🔴 <b style="color:#F87171">Red</b> = highest AI focus &nbsp;|&nbsp;'
+                '🟡 <b style="color:#FBBF24">Yellow</b> = moderate &nbsp;|&nbsp;'
+                '🔵 <b style="color:#60A5FA">Blue</b> = low attention</div>',
+                unsafe_allow_html=True)
+        else:
+            st.markdown(
+                '<div style="font-size:0.75rem;color:#334155;padding:0.75rem 1rem;'
+                'background:#0A0F1A;border:1px solid #0E1420;margin-bottom:0.75rem">'
+                'Grad-CAM not available for this model.</div>',
+                unsafe_allow_html=True)
+        st.markdown('<div class="zone-divider"></div>', unsafe_allow_html=True)
 
         col_prob, col_clin = st.columns([1, 1], gap="large")
 
