@@ -1110,134 +1110,138 @@ def generate_gradcam_overlay(model, img_pil, model_w, model_h, pred_index=None):
 
 def generate_pdf_report(class_label, confidence, uncertainty, model_name,
                          preds, class_labels, gradcam_img, preprocessed_img):
-    """Generate a PDF diagnostic report and return raw bytes."""
-    from fpdf import FPDF
-    import tempfile, os
-
-    # top_idx resolved locally so the probability table can bold the top class
+    try:
+        from reportlab.lib.pagesizes import A4
+    except ImportError:
+        import streamlit as st
+        st.error("reportlab not installed. Run: pip install reportlab")
+        return None
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
+                                     Table, TableStyle, HRFlowable, Image as RLImage)
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT
+    from io import BytesIO
     import numpy as _np
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                            rightMargin=20*mm, leftMargin=20*mm,
+                            topMargin=20*mm, bottomMargin=20*mm)
+    styles = getSampleStyleSheet()
+    story = []
+
+    # ── Styles ──────────────────────────────────────────────────────────────
+    title_style = ParagraphStyle('title', fontSize=20, fontName='Helvetica-Bold',
+                                  alignment=TA_CENTER, spaceAfter=4)
+    sub_style   = ParagraphStyle('sub', fontSize=10, textColor=colors.grey,
+                                  alignment=TA_CENTER, spaceAfter=12)
+    section_style = ParagraphStyle('section', fontSize=14, fontName='Helvetica-Bold',
+                                    spaceBefore=12, spaceAfter=6)
+    body_style  = ParagraphStyle('body', fontSize=10, spaceAfter=4)
+    disclaimer_style = ParagraphStyle('disc', fontSize=9, fontName='Helvetica-Bold',
+                                       textColor=colors.HexColor('#991b1b'),
+                                       backColor=colors.HexColor('#fef2f2'),
+                                       borderColor=colors.HexColor('#dc2626'),
+                                       borderWidth=1, borderPadding=8,
+                                       alignment=TA_CENTER, spaceAfter=16)
+
+    from datetime import datetime
     top_idx_local = int(_np.argmax(list(preds)))
 
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
+    # ── Header ──────────────────────────────────────────────────────────────
+    story.append(Paragraph("DermAI - Skin Lesion Analysis Report", title_style))
+    story.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", sub_style))
 
-    def clean_text(text):
-        if not isinstance(text, str):
-            from numbers import Number
-            if isinstance(text, Number): 
-                return str(text)
-            text = str(text)
-        # fpdf uses latin-1, replace common unicode chars that fail
-        return text.replace("—", "-").replace("·", "-").replace("🔴", "").replace("🟡", "").replace("🔵", "").replace("✅", "").replace("⚠️", "").replace("σ", "SD").encode('latin-1', 'replace').decode('latin-1')
-
-    # ── HEADER ──────────────────────────────────────────────────────────────
-    pdf.set_font("Helvetica", "B", 20)
-    pdf.set_text_color(30, 30, 30)
-    pdf.cell(0, 12, clean_text("DermAI - Skin Lesion Analysis Report"), ln=True, align="C")
-    pdf.set_font("Helvetica", "", 10)
-    pdf.set_text_color(100, 100, 100)
-    pdf.cell(0, 6, clean_text(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"),
-             ln=True, align="C")
-    pdf.ln(4)
-
-    # ── DISCLAIMER BOX ──────────────────────────────────────────────────────
-    pdf.set_fill_color(254, 242, 242)
-    pdf.set_draw_color(220, 38, 38)
-    pdf.set_text_color(153, 27, 27)
-    pdf.set_font("Helvetica", "B", 9)
-    pdf.multi_cell(0, 7,
-        clean_text("DISCLAIMER: This report is NOT a medical diagnosis. "
+    # ── Disclaimer ──────────────────────────────────────────────────────────
+    story.append(Paragraph(
+        "DISCLAIMER: This report is NOT a medical diagnosis. "
         "DermAI is an AI research tool for educational purposes only. "
-        "Always consult a qualified dermatologist for medical advice."),
-        border=1, fill=True, align="C")
-    pdf.ln(6)
+        "Always consult a qualified dermatologist for medical advice.",
+        disclaimer_style))
 
-    # ── PRIMARY DIAGNOSIS ───────────────────────────────────────────────────
-    pdf.set_text_color(30, 30, 30)
-    pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(0, 10, clean_text("Primary Diagnosis"), ln=True)
-    pdf.set_draw_color(200, 200, 200)
-    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-    pdf.ln(3)
+    # ── Primary Diagnosis ───────────────────────────────────────────────────
+    story.append(Paragraph("Primary Diagnosis", section_style))
+    story.append(HRFlowable(width="100%", thickness=1, color=colors.lightgrey))
+    story.append(Spacer(1, 6))
 
-    unc_level = ('High' if uncertainty >= 0.18
-                 else 'Moderate' if uncertainty >= 0.08
-                 else 'Low')
-    rows = [
-        ("Diagnosis",       class_label),
-        ("Confidence",      f"{confidence:.1f}%"),
-        ("TTA Uncertainty", f"{uncertainty:.4f} ({unc_level})"),
-        ("Model Used",      str(model_name).replace("—", "-").replace("·", "-")),
-        ("Report Date",     datetime.now().strftime('%Y-%m-%d')),
+    unc_level = 'High' if uncertainty >= 0.18 else 'Moderate' if uncertainty >= 0.08 else 'Low'
+    diag_data = [
+        ["Diagnosis",        class_label],
+        ["Confidence",       f"{confidence:.1f}%"],
+        ["TTA Uncertainty",  f"{uncertainty:.4f} ({unc_level})"],
+        ["Model Used",       str(model_name)],
+        ["Report Date",      datetime.now().strftime('%Y-%m-%d')],
     ]
-    for lbl, val in rows:
-        pdf.set_font("Helvetica", "B", 10)
-        pdf.cell(60, 8, clean_text(lbl + ":"), ln=False)
-        pdf.set_font("Helvetica", "", 10)
-        pdf.cell(0, 8, clean_text(val), ln=True)
-    pdf.ln(6)
+    diag_table = Table(diag_data, colWidths=[50*mm, 120*mm])
+    diag_table.setStyle(TableStyle([
+        ('FONTNAME',  (0,0), (0,-1), 'Helvetica-Bold'),
+        ('FONTSIZE',  (0,0), (-1,-1), 10),
+        ('ROWBACKGROUNDS', (0,0), (-1,-1), [colors.white, colors.HexColor('#f9fafb')]),
+        ('GRID',      (0,0), (-1,-1), 0.5, colors.lightgrey),
+        ('PADDING',   (0,0), (-1,-1), 6),
+    ]))
+    story.append(diag_table)
+    story.append(Spacer(1, 12))
 
-    # ── CLASS PROBABILITY TABLE ─────────────────────────────────────────────
-    pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(0, 10, clean_text("Class Probability Breakdown"), ln=True)
-    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-    pdf.ln(3)
-
-    pdf.set_fill_color(240, 240, 240)
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.cell(120, 8, clean_text("Diagnosis Class"), border=1, fill=True)
-    pdf.cell(0,   8, clean_text("Probability"),     border=1, fill=True, ln=True)
+    # ── Class Probability Table ──────────────────────────────────────────────
+    story.append(Paragraph("Class Probability Breakdown", section_style))
+    story.append(HRFlowable(width="100%", thickness=1, color=colors.lightgrey))
+    story.append(Spacer(1, 6))
 
     sorted_preds = sorted(enumerate(preds), key=lambda x: x[1], reverse=True)
+    prob_data = [["Diagnosis Class", "Probability"]]
     for idx, prob in sorted_preds:
-        pdf.set_font("Helvetica", "B" if idx == top_idx_local else "", 10)
-        pdf.cell(120, 7, clean_text(class_labels[idx]), border=1)
-        pdf.cell(0,   7, clean_text(f"{prob * 100:.2f}%"), border=1, ln=True)
-    pdf.ln(6)
+        prob_data.append([class_labels[idx], f"{prob*100:.2f}%"])
 
-    # ── PREPROCESSING PIPELINE ──────────────────────────────────────────────
-    pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(0, 10, clean_text("Preprocessing Pipeline Applied"), ln=True)
-    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-    pdf.ln(3)
-    pdf.set_font("Helvetica", "", 10)
-    for step in [
-        "Blur Detection",
-        "Annotation Removal",
-        "Hair Removal (DullRazor)",
-        "Lighting Normalization (CLAHE)",
-        "10-Pass Test-Time Augmentation (TTA)",
-    ]:
-        pdf.cell(0, 7, clean_text(f"  +  {step}"), ln=True)
-    pdf.ln(6)
+    prob_table = Table(prob_data, colWidths=[120*mm, 50*mm])
+    prob_style = [
+        ('BACKGROUND',  (0,0), (-1,0), colors.HexColor('#1e293b')),
+        ('TEXTCOLOR',   (0,0), (-1,0), colors.white),
+        ('FONTNAME',    (0,0), (-1,0), 'Helvetica-Bold'),
+        ('FONTSIZE',    (0,0), (-1,-1), 10),
+        ('GRID',        (0,0), (-1,-1), 0.5, colors.lightgrey),
+        ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor('#f9fafb')]),
+        ('PADDING',     (0,0), (-1,-1), 6),
+    ]
+    # Bold the top prediction row
+    top_row = next(i+1 for i,(idx,_) in enumerate(sorted_preds) if idx == top_idx_local)
+    prob_style.append(('FONTNAME', (0, top_row), (-1, top_row), 'Helvetica-Bold'))
+    prob_style.append(('BACKGROUND', (0, top_row), (-1, top_row), colors.HexColor('#fef9c3')))
+    prob_table.setStyle(TableStyle(prob_style))
+    story.append(prob_table)
+    story.append(Spacer(1, 12))
 
-    # ── PAGE 2: GRAD-CAM IMAGE ──────────────────────────────────────────────
+    # ── Preprocessing Pipeline ───────────────────────────────────────────────
+    story.append(Paragraph("Preprocessing Pipeline Applied", section_style))
+    story.append(HRFlowable(width="100%", thickness=1, color=colors.lightgrey))
+    story.append(Spacer(1, 6))
+    for step in ["Blur Detection", "Annotation Removal",
+                 "Hair Removal (DullRazor)", "Lighting Normalization (CLAHE)",
+                 "10-Pass Test-Time Augmentation (TTA)"]:
+        story.append(Paragraph(f"[OK]  {step}", body_style))
+
+    # ── Page 2: Grad-CAM ─────────────────────────────────────────────────────
     if gradcam_img is not None:
-        pdf.add_page()
-        pdf.set_font("Helvetica", "B", 14)
-        pdf.set_text_color(30, 30, 30)
-        pdf.cell(0, 10, clean_text("AI Explainability - Grad-CAM Heatmap"), ln=True)
-        pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-        pdf.ln(3)
-        pdf.set_font("Helvetica", "", 9)
-        pdf.set_text_color(100, 100, 100)
-        pdf.multi_cell(0, 6,
-            clean_text("The heatmap shows which regions the AI focused on when making "
-            "its prediction. Red/yellow areas indicate high activation."))
+        from reportlab.platypus import PageBreak
+        story.append(PageBreak())
+        story.append(Paragraph("AI Explainability - Grad-CAM Heatmap", section_style))
+        story.append(HRFlowable(width="100%", thickness=1, color=colors.lightgrey))
+        story.append(Spacer(1, 6))
+        story.append(Paragraph(
+            "Red/yellow regions show where the AI focused when making its prediction.",
+            body_style))
+        story.append(Spacer(1, 8))
+        from io import BytesIO as _BytesIO
+        _img_buf = _BytesIO()
+        gradcam_img.save(_img_buf, format='PNG')
+        _img_buf.seek(0)
+        story.append(RLImage(_img_buf, width=160*mm, height=120*mm))
 
-        pdf.ln(4)
-        tmp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                gradcam_img.save(tmp.name)
-                tmp_path = tmp.name
-            pdf.image(tmp_path, x=25, w=160)
-        finally:
-            if tmp_path and os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-
-    return bytes(pdf.output())
+    doc.build(story)
+    return buf.getvalue()   # always returns bytes — guaranteed
 
 
 def detect_blur(img):
@@ -1756,6 +1760,34 @@ elif current_page == "Predict":
         </div>
         """, unsafe_allow_html=True)
 
+        st.markdown("---")
+        st.markdown("### 📄 Diagnosis Report")
+        try:
+            pdf_bytes = generate_pdf_report(
+                class_label      = CLASS_LABELS[top_idx],
+                confidence       = top_conf,
+                uncertainty      = tta_uncertainty,
+                model_name       = sel_model_name,
+                preds            = preds,
+                class_labels     = CLASS_LABELS,
+                gradcam_img      = st.session_state.get("gradcam_image"),
+                preprocessed_img = st.session_state.get("preprocessed_image"),
+            )
+            if pdf_bytes is not None and len(pdf_bytes) > 0:
+                st.download_button(
+                    label               = "📄 Download Diagnosis Report (PDF)",
+                    data                = pdf_bytes,
+                    file_name           = f"DermAI_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                    mime                = "application/pdf",
+                    use_container_width = True,
+                    key                 = "pdf_download_btn"
+                )
+            else:
+                st.error("pdf_bytes is None — function returned without error")
+        except Exception as e:
+            st.error(f"PDF generation failed: {type(e).__name__}: {e}")
+        st.markdown("---")
+
         # Metrics strip
         risk_display = info["risk"].replace(" — High Risk", "")
         st.markdown(f"""
@@ -1805,30 +1837,6 @@ elif current_page == "Predict":
             f'<div style="font-size:0.72rem;color:#64748B;margin-top:0.2rem">{unc_desc}</div>'
             f'</div></div>',
             unsafe_allow_html=True)
-
-        # ── PDF Report Download ───────────────────────────────────────────────
-        try:
-            pdf_bytes = generate_pdf_report(
-                class_label      = CLASS_LABELS[top_idx],
-                confidence       = top_conf,
-                uncertainty      = tta_uncertainty,
-                model_name       = sel_model_name,
-                preds            = preds,
-                class_labels     = CLASS_LABELS,
-                gradcam_img      = st.session_state.get("gradcam_image"),
-                preprocessed_img = st.session_state.get("preprocessed_image"),
-            )
-            st.download_button(
-                label               = "📄 Download Diagnosis Report (PDF)",
-                data                = pdf_bytes,
-                file_name           = f"DermAI_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
-                mime                = "application/pdf",
-                use_container_width = True,
-            )
-        except Exception as _pdf_err:
-            print(f"PDF GENERATION ERROR: {_pdf_err}")
-            st.caption(f"PDF generation unavailable: {_pdf_err}")
-
 
         st.markdown('<div class="zone-label">🔬 AI Explainability — Grad-CAM</div>', unsafe_allow_html=True)
         gcam = st.session_state.get("gradcam_image", None)
