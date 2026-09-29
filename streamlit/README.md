@@ -1,14 +1,3 @@
----
-title: DermAI Skin Cancer Detection
-emoji: 🔬
-colorFrom: blue
-colorTo: green
-sdk: streamlit
-sdk_version: 1.40.2
-app_file: app.py
-pinned: false
-license: mit
----
 
 # 🔬 DermAI — AI-Based Skin Cancer Detection
 
